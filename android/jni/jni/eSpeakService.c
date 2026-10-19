@@ -28,6 +28,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <string.h>
+#include <math.h>
 #include <jni.h>
 
 #include <espeak-ng/speak_lib.h>
@@ -156,14 +157,21 @@ static int SynthCallback(short *audioData, int numSamples,
   }
 
   if (numSamples > 0) {
-	  /* Volume boost with soft limiter */
+	    /* Volume boost with treble lift and smooth limiter */
     const float GAIN = 1.5f;
+    const float LIFT = 0.25f;
+    const float KNEE = 20000.0f;
+    const float RANGE = 32767.0f - KNEE;
+    static float prev = 0.0f;
     for (int i = 0; i < numSamples; i++) {
-      float x = audioData[i] * GAIN;
-      if (x > 24000.0f)  x = 24000.0f + (x - 24000.0f) * 0.25f;
-      if (x < -24000.0f) x = -24000.0f + (x + 24000.0f) * 0.25f;
-      if (x > 32767.0f)  x = 32767.0f;
-      if (x < -32768.0f) x = -32768.0f;
+      float s = audioData[i];
+      float x = (s + LIFT * (s - prev)) * GAIN;
+      prev = s;
+      float a = x < 0 ? -x : x;
+      if (a > KNEE) {
+        a = KNEE + RANGE * tanhf((a - KNEE) / RANGE);
+        x = x < 0 ? -a : a;
+      }
       audioData[i] = (short)x;
 	}
     jbyteArray arrayAudioData = (*env)->NewByteArray(env, numSamples * 2);
