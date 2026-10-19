@@ -156,6 +156,16 @@ static int SynthCallback(short *audioData, int numSamples,
   }
 
   if (numSamples > 0) {
+	  /* Volume boost with soft limiter */
+    const float GAIN = 1.5f;
+    for (int i = 0; i < numSamples; i++) {
+      float x = audioData[i] * GAIN;
+      if (x > 24000.0f)  x = 24000.0f + (x - 24000.0f) * 0.25f;
+      if (x < -24000.0f) x = -24000.0f + (x + 24000.0f) * 0.25f;
+      if (x > 32767.0f)  x = 32767.0f;
+      if (x < -32768.0f) x = -32768.0f;
+      audioData[i] = (short)x;
+	}
     jbyteArray arrayAudioData = (*env)->NewByteArray(env, numSamples * 2);
     (*env)->SetByteArrayRegion(env, arrayAudioData, 0, (numSamples * 2), (jbyte *) audioData);
     (*env)->CallVoidMethod(env, object, METHOD_nativeSynthCallback, arrayAudioData);
