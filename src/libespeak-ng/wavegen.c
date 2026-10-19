@@ -879,7 +879,7 @@ static int Wavegen(int length, int modulation, bool resume, frame_t *fr1, frame_
 			echo_tail = 0;
 
 		z = (z1 * agc) >> 8;
-
+	    z = z * 2;
 		// check for overflow, 16bit signed samples
 		if (z >= 32768) {
 			ov = 8388608/z1 - 1;      // 8388608 is 2^23, i.e. max value * 256
