@@ -158,8 +158,8 @@ static int SynthCallback(short *audioData, int numSamples,
 
   if (numSamples > 0) {
 	    /* Volume boost with treble lift and smooth limiter */
-    const float GAIN = 1.5f;
-    const float LIFT = 0.25f;
+    const float GAIN = 2.5f;
+    const float LIFT = 0.35f;
     const float KNEE = 20000.0f;
     const float RANGE = 32767.0f - KNEE;
     static float prev = 0.0f;
