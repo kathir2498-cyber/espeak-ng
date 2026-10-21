@@ -157,23 +157,29 @@ static int SynthCallback(short *audioData, int numSamples,
   }
 
   if (numSamples > 0) {
-	    /* Volume boost with treble lift and smooth limiter */
-    const float GAIN = 2.5f;
-    const float LIFT = 0.35f;
-    const float KNEE = 20000.0f;
-    const float RANGE = 32767.0f - KNEE;
+	    /* Volume boost with smooth auto-gain */
+    const float GAIN = 2.0f;
+    const float LIFT = 0.2f;
+    const float CEILING = 30000.0f;
+    const float ATTACK = 0.8f;
+    const float RELEASE = 0.0005f;
     static float prev = 0.0f;
+    static float env_gain = 1.0f;
     for (int i = 0; i < numSamples; i++) {
       float s = audioData[i];
       float x = (s + LIFT * (s - prev)) * GAIN;
       prev = s;
       float a = x < 0 ? -x : x;
-      if (a > KNEE) {
-        a = KNEE + RANGE * tanhf((a - KNEE) / RANGE);
-        x = x < 0 ? -a : a;
-      }
+      float need = (a > CEILING) ? CEILING / a : 1.0f;
+      if (need < env_gain)
+        env_gain += (need - env_gain) * ATTACK;
+      else
+        env_gain += (need - env_gain) * RELEASE;
+      x *= env_gain;
+      if (x > 32767.0f) x = 32767.0f;
+      if (x < -32768.0f) x = -32768.0f;
       audioData[i] = (short)x;
-	}
+    }
     jbyteArray arrayAudioData = (*env)->NewByteArray(env, numSamples * 2);
     (*env)->SetByteArrayRegion(env, arrayAudioData, 0, (numSamples * 2), (jbyte *) audioData);
     (*env)->CallVoidMethod(env, object, METHOD_nativeSynthCallback, arrayAudioData);
