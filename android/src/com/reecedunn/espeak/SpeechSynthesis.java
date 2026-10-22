@@ -61,6 +61,7 @@ public class SpeechSynthesis {
     private final Context mContext;
     private final SynthReadyCallback mCallback;
     private final String mDatapath;
+    private volatile float volumeBoost = 1.0f;
 
     private boolean mInitialized = false;
     private static int mVoiceCount = 0;
@@ -226,13 +227,17 @@ public class SpeechSynthesis {
         public int getValue() {
             return nativeGetParameter(id, 1);
         }
-
-        public void setValue(int value, int scale) {
+                public void setValue(int value, int scale) {
             setValue((value * scale) / 100);
         }
 
         public void setValue(int value) {
-            nativeSetParameter(id, value);
+            if (id == 2) {
+                volumeBoost = (value > 50) ? 1.0f + (value - 50) / 100.0f : 1.0f;
+                nativeSetParameter(id, Math.min(value, 50));
+            } else {
+                nativeSetParameter(id, value);
+            }
         }
 
         public UnitType getUnitType() {
@@ -267,11 +272,26 @@ public class SpeechSynthesis {
         if (mCallback == null)
             return;
 
-        if (audioData == null) {
+            if (audioData == null) {
             mCallback.onSynthDataComplete();
         } else {
+            final float boost = volumeBoost;
+            if (boost > 1.0f) {
+                for (int i = 0; i + 1 < audioData.length; i += 2) {
+                    int s = (audioData[i] & 0xFF) | (audioData[i + 1] << 8);
+                    float x = s * boost;
+                    float a = Math.abs(x);
+                    if (a > 20000f) {
+                        a = 20000f + 12767f * (float) Math.tanh((a - 20000f) / 12767f);
+                        x = x < 0 ? -a : a;
+                    }
+                    int v = (int) x;
+                    audioData[i] = (byte) (v & 0xFF);
+                    audioData[i + 1] = (byte) ((v >> 8) & 0xFF);
+                }
+            }
             mCallback.onSynthDataReady(audioData);
-        }
+            } 
     }
 
     @SuppressWarnings("unused") // called from eSpeakService.c
