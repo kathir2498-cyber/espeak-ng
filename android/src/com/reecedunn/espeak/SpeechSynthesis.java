@@ -19,7 +19,7 @@
  * This file implements the Java API to eSpeak using the JNI bindings.
  *
  * Android Version: 4.0 (Ice Cream Sandwich)
- * API Version:     14
+ * API Version:     14 hi
  */
 
 package com.reecedunn.espeak;
