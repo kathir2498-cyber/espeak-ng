@@ -19,8 +19,7 @@
 /*
  * This file implements the Android Text-to-Speech engine for eSpeak.
  *
- * Android Version: 4.0 (Ice Cream Sandwich)
- * API Version:     14
+ * Minimum API Version: 21 (compiles and runs unchanged on Android 15 / 16)
  */
 
 package com.reecedunn.espeak;
@@ -28,9 +27,11 @@ package com.reecedunn.espeak;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.media.AudioFormat;
 import android.media.AudioTrack;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Process;
 import android.preference.PreferenceManager;
 import android.speech.tts.SynthesisCallback;
 import android.speech.tts.SynthesisRequest;
@@ -61,11 +62,31 @@ public class TtsService extends TextToSpeechService {
     private static Context storageContext;
     private static final boolean DEBUG = BuildConfig.DEBUG;
 
+    /**
+     * Longest slice of PCM, in milliseconds, handed to the framework in a
+     * single {@link SynthesisCallback#audioAvailable} call. The framework's
+     * own limit ({@link SynthesisCallback#getMaxBufferSize()}) is far larger
+     * (several hundred ms at eSpeak's sample rate), so capping the slice lets
+     * the first audible samples reach the AudioTrack as early as possible and
+     * lets a stop take effect between slices.
+     */
+    private static final int MAX_CHUNK_MS = 20;
+
     private SpeechSynthesis mEngine;
-    private SynthesisCallback mCallback;
+    private volatile SynthesisCallback mCallback;
+
+    /**
+     * Set by {@link #onStop()} (binder thread) the instant the framework asks
+     * us to stop, and cleared when the next request begins. Read by the
+     * synthesis thread so that no further audio is pushed after a stop.
+     */
+    private volatile boolean mStopRequested;
+
+    /** Size in bytes of the PCM slices passed to the framework (frame aligned). */
+    private volatile int mChunkBytes;
 
     /** Text handed to eSpeak for the current request. */
-    private String mSynthText;
+    private volatile String mSynthText;
     /** Where {@link #mSynthText} starts within the text the caller supplied. */
     private int mSynthTextOffset;
     /**
@@ -109,6 +130,12 @@ public class TtsService extends TextToSpeechService {
 
     @Override
     public void onDestroy() {
+        // Make sure nothing keeps producing audio into a dying service.
+        mStopRequested = true;
+        final SpeechSynthesis engine = mEngine;
+        if (engine != null) {
+            engine.stop();
+        }
         super.onDestroy();
         if (mPreferences != null) {
             mPreferences.unregisterOnSharedPreferenceChangeListener(mOnPreferencesChanged);
@@ -300,17 +327,33 @@ public class TtsService extends TextToSpeechService {
         }
     }
 
+    /**
+     * Called by the framework, on a binder thread, when the current utterance
+     * must stop (for example when TalkBack moves focus to another element).
+     *
+     * <p>This method deliberately takes no lock: {@link #onSynthesizeText} is
+     * {@code synchronized} and may still be running, and waiting for it here
+     * would add exactly the delay a stop is supposed to remove. It only raises
+     * a volatile flag, which the synthesis thread checks between PCM slices,
+     * and cancels the native engine so that synthesis stops producing audio.
+     */
     @Override
     protected void onStop() {
-        Log.i(TAG, "Received stop request.");
+        mStopRequested = true;
 
-        mEngine.stop();
+        final SpeechSynthesis engine = mEngine;
+        if (engine != null) {
+            engine.stop();
+        }
+
+        if (DEBUG) Log.i(TAG, "Received stop request.");
     }
 
     @SuppressWarnings("deprecation")
     private String getRequestString(SynthesisRequest request) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            return request.getCharSequenceText().toString();
+            final CharSequence text = request.getCharSequenceText();
+            return (text == null) ? null : text.toString();
         } else {
             return request.getText();
         }
@@ -375,6 +418,43 @@ public class TtsService extends TextToSpeechService {
     }
 
     /**
+     * Number of bytes in one sample of the given PCM encoding.
+     */
+    private static int bytesPerSample(int audioFormat) {
+        switch (audioFormat) {
+            case AudioFormat.ENCODING_PCM_8BIT:
+                return 1;
+            case AudioFormat.ENCODING_PCM_FLOAT:
+                return 4;
+            case AudioFormat.ENCODING_PCM_16BIT:
+            default:
+                return 2;
+        }
+    }
+
+    /**
+     * Works out how many bytes of PCM make up {@link #MAX_CHUNK_MS}, rounded
+     * down to a whole number of frames and never above the framework's
+     * {@link SynthesisCallback#getMaxBufferSize()}.
+     */
+    private int computeChunkBytes(SynthesisCallback callback, int sampleRate,
+                                  int audioFormat, int channelCount) {
+        final int maxBufferSize = Math.max(1, callback.getMaxBufferSize());
+        final int frameBytes = bytesPerSample(audioFormat) * Math.max(1, channelCount);
+        final long frames = Math.max(1L, ((long) sampleRate * MAX_CHUNK_MS) / 1000L);
+
+        long bytes = frames * frameBytes;
+        if (bytes > maxBufferSize) {
+            bytes = maxBufferSize;
+        }
+        // Keep slices frame aligned so a slice never splits a sample.
+        if (bytes >= frameBytes) {
+            bytes -= bytes % frameBytes;
+        }
+        return (int) Math.max(1L, bytes);
+    }
+
+    /**
      * Converts a 0-based code point index within {@link #mSynthText} into the
      * UTF-16 index that {@link SynthesisCallback#rangeStart} expects.
      *
@@ -400,6 +480,19 @@ public class TtsService extends TextToSpeechService {
 
     @Override
     protected synchronized void onSynthesizeText(SynthesisRequest request, SynthesisCallback callback) {
+        // The framework runs this on its own synthesis thread. Raise that
+        // thread to audio priority so eSpeak is not preempted while producing
+        // the first buffers of an utterance.
+        try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
+        } catch (RuntimeException e) {
+            if (DEBUG) Log.w(TAG, "Unable to raise synthesis thread priority", e);
+        }
+
+        // A new request is starting; any earlier stop belonged to the
+        // previous utterance.
+        mStopRequested = false;
+
         if (selectVoice(request) == TextToSpeech.ERROR) {
             reportError(callback, CheckVoiceData.hasBaseResources(storageContext)
                     ? TextToSpeech.ERROR_SERVICE : TextToSpeech.ERROR_NOT_INSTALLED_YET);
@@ -425,9 +518,11 @@ public class TtsService extends TextToSpeechService {
             Log.i(TAG, "Received synthesis request: {language=\"" + voice.name + "\"}");
 
             final Bundle params = request.getParams();
-            for (String key : params.keySet()) {
-                Log.v(TAG,
-                        "Synthesis request contained param {" + key + ", " + params.get(key) + "}");
+            if (params != null) {
+                for (String key : params.keySet()) {
+                    Log.v(TAG,
+                            "Synthesis request contained param {" + key + ", " + params.get(key) + "}");
+                }
             }
         }
 
@@ -453,7 +548,9 @@ public class TtsService extends TextToSpeechService {
             }
         }
 
-        final VoiceSettings settings = new VoiceSettings(PreferenceManager.getDefaultSharedPreferences(storageContext), mEngine);
+        // Reuse the preferences instance opened in onCreate() instead of
+        // looking it up again for every utterance.
+        final VoiceSettings settings = new VoiceSettings(mPreferences, mEngine);
 
         // Detect SSML before normalizing. Real markup is ASCII, which NFKC
         // leaves untouched, but normalization can turn lookalikes such as a
@@ -476,8 +573,13 @@ public class TtsService extends TextToSpeechService {
         mAnchorCodePoint = 0;
         mAnchorOffset = 0;
 
+        final int sampleRate = mEngine.getSampleRate();
+        final int audioFormat = mEngine.getAudioFormat();
+        final int channelCount = mEngine.getChannelCount();
+
         mCallback = callback;
-        mCallback.start(mEngine.getSampleRate(), mEngine.getAudioFormat(), mEngine.getChannelCount());
+        mChunkBytes = computeChunkBytes(callback, sampleRate, audioFormat, channelCount);
+        callback.start(sampleRate, audioFormat, channelCount);
 
         mEngine.setVoice(voice, settings.getVoiceVariant());
 
@@ -493,6 +595,15 @@ public class TtsService extends TextToSpeechService {
         mEngine.Volume.setValue(settings.getVolume());
         mEngine.Punctuation.setValue(settings.getPunctuationLevel());
         mEngine.setPunctuationCharacters(settings.getPunctuationCharacters());
+
+        // A stop may have arrived while the request was being set up, before
+        // the engine was running to receive it. Don't start an utterance
+        // nobody is going to hear.
+        if (mStopRequested) {
+            callback.done();
+            return;
+        }
+
         mEngine.synthesize(text, isSsml);
     }
 
@@ -528,20 +639,42 @@ public class TtsService extends TextToSpeechService {
                 return;
             }
 
-            final int maxBytesToCopy = mCallback.getMaxBufferSize();
+            final SynthesisCallback callback = mCallback;
+            if (callback == null || mStopRequested) {
+                // A stop is in flight: drop this buffer instead of queueing
+                // audio that would play after focus has already moved on.
+                return;
+            }
+
+            // Hand the buffer over in short slices so the first samples of an
+            // utterance reach the AudioTrack immediately, and so a stop is
+            // honoured within one slice rather than after the whole buffer.
+            final int frameworkMax = Math.max(1, callback.getMaxBufferSize());
+            final int configuredChunk = mChunkBytes;
+            final int maxBytesToCopy = (configuredChunk > 0)
+                    ? Math.min(configuredChunk, frameworkMax)
+                    : frameworkMax;
 
             int offset = 0;
 
             while (offset < audioData.length) {
+                if (mStopRequested) {
+                    return;
+                }
+
                 final int bytesToWrite = Math.min(maxBytesToCopy, (audioData.length - offset));
-                if (mCallback.audioAvailable(audioData, offset, bytesToWrite)
+                if (callback.audioAvailable(audioData, offset, bytesToWrite)
                         != TextToSpeech.SUCCESS) {
                     // The framework has stopped accepting audio for this
                     // request, so the rest of the buffer has nowhere to go.
                     // A stop normally reaches the engine through onStop();
                     // stopping here as well covers a failure that arrives
                     // without one.
-                    mEngine.stop();
+                    mStopRequested = true;
+                    final SpeechSynthesis engine = mEngine;
+                    if (engine != null) {
+                        engine.stop();
+                    }
                     return;
                 }
                 offset += bytesToWrite;
@@ -550,14 +683,20 @@ public class TtsService extends TextToSpeechService {
 
         @Override
         public void onSynthDataComplete() {
-            mCallback.done();
+            final SynthesisCallback callback = mCallback;
+            if (callback != null) {
+                callback.done();
+            }
         }
 
         @Override
         public void onSynthWordBoundary(int textPosition, int textLength, int markerInFrames) {
             // rangeStart() is API 26; below that the framework has no way to
             // deliver word boundaries to the caller.
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || mSynthText == null) {
+            final SynthesisCallback callback = mCallback;
+            final String synthText = mSynthText;
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+                    || callback == null || synthText == null || mStopRequested) {
                 return;
             }
 
@@ -576,7 +715,7 @@ public class TtsService extends TextToSpeechService {
                 return;
             }
 
-            mCallback.rangeStart(markerInFrames, mSynthTextOffset + start, mSynthTextOffset + end);
+            callback.rangeStart(markerInFrames, mSynthTextOffset + start, mSynthTextOffset + end);
         }
     };
 }
