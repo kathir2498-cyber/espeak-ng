@@ -23,6 +23,9 @@
  */
 
 #include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <wchar.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -34,7 +37,17 @@
 #include <espeak-ng/speak_lib.h>
 #include <Log.h>
 
-#define BUFFER_SIZE_IN_MILLISECONDS 300
+/* Length of the buffer espeak fills before it invokes the synth callback.
+ *
+ * This is the main driver of time-to-first-audio and of stop latency: espeak
+ * only calls SynthCallback when this buffer is full (or at the end of the
+ * request), and the stop flag is only polled from that callback.  300 ms meant
+ * the first syllables were held back until 300 ms of audio had been rendered,
+ * and a stop could take up to 300 ms of synthesis time to be noticed.  50 ms
+ * keeps the JNI call rate sane (~20/s) while cutting both latencies ~6x.
+ * Raise it if a low-end device underruns, lower it (down to ~30) for even
+ * snappier response. */
+#define BUFFER_SIZE_IN_MILLISECONDS 50
 
 /* These are helpers for converting a jstring to wchar_t*.
  *
@@ -101,22 +114,111 @@ static JavaVM *jvm = NULL;
 jmethodID METHOD_nativeSynthCallback;
 jmethodID METHOD_nativeSynthWordCallback;
 
+/* Everything below except stop_requested is only ever touched by the synthesis
+ * thread (espeak runs AUDIO_OUTPUT_SYNCHRONOUS, so SynthCallback executes on
+ * the same thread that called nativeSynthesize). */
+
 /* Audio frames handed to the Java layer so far for the current request.
  * Reset by nativeSynthesize before each espeak_Synth call. */
 static int frames_delivered = 0;
 
+/* Non-zero once Java has been told the current request is over.  Guarantees
+ * the Java side hears "done" exactly once per request, even if a stop races
+ * with the natural end of the stream. */
+static int completion_sent = 0;
+
+/* JNIEnv of the synthesis thread, cached by nativeSynthesize.  JNIEnv is
+ * per-thread, so this avoids calling AttachCurrentThread() (a JavaVM call that
+ * takes VM locks) for every single audio chunk. */
+static __thread JNIEnv *tls_env = NULL;
+
 /* Set by nativeStop from the framework's control thread while espeak_Synth is
- * still running on the synthesis thread.  espeak_ng_Cancel() cannot interrupt a
- * synthesis in progress -- its body is entirely #if USE_ASYNC, which this build
- * disables -- so returning SYNTH_ABORT from the callback is the only way to end
- * one early.  Without it a stop has to wait for the whole utterance to be
- * synthesized, which is silence for as long as the text the user just left. */
+ * still running on the synthesis thread.  Returning SYNTH_ABORT from the
+ * callback is the only way to end a synthesis early: espeak_ng_Cancel() cannot
+ * interrupt one in progress (its body is entirely #if USE_ASYNC, which this
+ * build disables).
+ *
+ * This is a lock-free atomic: nativeStop never blocks, never takes a mutex and
+ * never touches espeak state, so it returns in nanoseconds.  The synthesis
+ * thread notices the flag at the next callback (at most
+ * BUFFER_SIZE_IN_MILLISECONDS of synthesis away), and again right before it
+ * would hand any audio to Java, so no stale audio is delivered after a stop. */
 static atomic_int stop_requested;
 
-static JNIEnv *getJniEnv() {
-  JNIEnv *env = NULL;
-  (*jvm)->AttachCurrentThread(jvm, &env, NULL);
+static inline bool stop_is_requested(void) {
+  return atomic_load_explicit(&stop_requested, memory_order_acquire) != 0;
+}
+
+/* Automatic gain state for the volume boost.  Reset per request so one
+ * utterance cannot leak gain reduction or filter history into the next. */
+static float agc_prev = 0.0f;
+static float agc_gain = 1.0f;
+
+static JNIEnv *getJniEnv(void) {
+  JNIEnv *env = tls_env;
+  if (env != NULL)
+    return env;
+
+  /* Fallback if the callback ever runs on a thread nativeSynthesize did not
+   * register (should not happen in synchronous mode).  Prefer GetEnv, which is
+   * cheap, and only attach when the thread is genuinely detached. */
+  if ((*jvm)->GetEnv(jvm, (void **) &env, JNI_VERSION_1_6) != JNI_OK) {
+    env = NULL;
+    (*jvm)->AttachCurrentThread(jvm, &env, NULL);
+  }
+  tls_env = env;
   return env;
+}
+
+/* Returns true (and clears the exception) if a Java callback threw.  Leaving an
+ * exception pending while continuing to make JNI calls is undefined behaviour,
+ * so a throwing callback aborts the synthesis instead. */
+static bool java_threw(JNIEnv *env) {
+  if ((*env)->ExceptionCheck(env)) {
+    (*env)->ExceptionClear(env);
+    return true;
+  }
+  return false;
+}
+
+/* Tell the Java side the request is over (a NULL buffer), at most once. */
+static void notify_done(JNIEnv *env, jobject object) {
+  if (completion_sent)
+    return;
+  completion_sent = 1;
+  (*env)->CallVoidMethod(env, object, METHOD_nativeSynthCallback, NULL);
+  java_threw(env);
+}
+
+/* Volume boost with smooth auto-gain, applied in place. */
+static void apply_gain(short *audioData, int numSamples) {
+  const float GAIN = 2.0f;
+  const float LIFT = 0.2f;
+  const float CEILING = 30000.0f;
+  const float ATTACK = 0.8f;
+  const float RELEASE = 0.0005f;
+
+  float prev = agc_prev;
+  float env_gain = agc_gain;
+
+  for (int i = 0; i < numSamples; i++) {
+    float s = audioData[i];
+    float x = (s + LIFT * (s - prev)) * GAIN;
+    prev = s;
+    float a = x < 0 ? -x : x;
+    float need = (a > CEILING) ? CEILING / a : 1.0f;
+    if (need < env_gain)
+      env_gain += (need - env_gain) * ATTACK;
+    else
+      env_gain += (need - env_gain) * RELEASE;
+    x *= env_gain;
+    if (x > 32767.0f) x = 32767.0f;
+    if (x < -32768.0f) x = -32768.0f;
+    audioData[i] = (short)x;
+  }
+
+  agc_prev = prev;
+  agc_gain = env_gain;
 }
 
 /* Callback from espeak.  Should call back to the TTS API */
@@ -125,13 +227,16 @@ static int SynthCallback(short *audioData, int numSamples,
   JNIEnv *env = getJniEnv();
   jobject object = (jobject)events->user_data;
 
+  if (env == NULL || object == NULL)
+    return SYNTH_ABORT;
+
   /* espeak marks the end of the request with a NULL buffer, not with a zero
    * sample count -- an empty buffer can legitimately occur mid-stream. */
-  if (audioData == NULL || atomic_load(&stop_requested)) {
+  if (audioData == NULL || stop_is_requested()) {
     /* Report completion either way: espeak returns ENS_SPEECH_STOPPED without
      * a final NULL-buffer callback when aborted, so this is the only place the
      * Java side hears that the request is over and can call done(). */
-    (*env)->CallVoidMethod(env, object, METHOD_nativeSynthCallback, NULL);
+    notify_done(env, object);
     return SYNTH_ABORT;
   }
 
@@ -154,39 +259,40 @@ static int SynthCallback(short *audioData, int numSamples,
     (*env)->CallVoidMethod(env, object, METHOD_nativeSynthWordCallback,
                            (jint) event->text_position, (jint) event->length,
                            (jint) marker);
+    if (java_threw(env)) {
+      notify_done(env, object);
+      return SYNTH_ABORT;
+    }
   }
 
   if (numSamples > 0) {
-	    /* Volume boost with smooth auto-gain */
-    const float GAIN = 2.0f;
-    const float LIFT = 0.2f;
-    const float CEILING = 30000.0f;
-    const float ATTACK = 0.8f;
-    const float RELEASE = 0.0005f;
-    static float prev = 0.0f;
-    static float env_gain = 1.0f;
-    for (int i = 0; i < numSamples; i++) {
-      float s = audioData[i];
-      float x = (s + LIFT * (s - prev)) * GAIN;
-      prev = s;
-      float a = x < 0 ? -x : x;
-      float need = (a > CEILING) ? CEILING / a : 1.0f;
-      if (need < env_gain)
-        env_gain += (need - env_gain) * ATTACK;
-      else
-        env_gain += (need - env_gain) * RELEASE;
-      x *= env_gain;
-      if (x > 32767.0f) x = 32767.0f;
-      if (x < -32768.0f) x = -32768.0f;
-      audioData[i] = (short)x;
+    /* Last chance to drop a stale chunk: if the user moved focus while the word
+     * events were being dispatched, do not push this audio to the player. */
+    if (stop_is_requested()) {
+      notify_done(env, object);
+      return SYNTH_ABORT;
     }
+
+    apply_gain(audioData, numSamples);
+
     jbyteArray arrayAudioData = (*env)->NewByteArray(env, numSamples * 2);
+    if (arrayAudioData == NULL) {
+      /* OutOfMemoryError is pending; clear it and end the request. */
+      java_threw(env);
+      notify_done(env, object);
+      return SYNTH_ABORT;
+    }
     (*env)->SetByteArrayRegion(env, arrayAudioData, 0, (numSamples * 2), (jbyte *) audioData);
     (*env)->CallVoidMethod(env, object, METHOD_nativeSynthCallback, arrayAudioData);
     /* The callback runs many times per request without returning to Java, so
      * the local reference has to be released here or the table overflows. */
     (*env)->DeleteLocalRef(env, arrayAudioData);
     frames_delivered += numSamples;
+
+    if (java_threw(env)) {
+      notify_done(env, object);
+      return SYNTH_ABORT;
+    }
   }
 
   return SYNTH_CONTINUE;
@@ -378,18 +484,43 @@ JNIEXPORT jboolean
 JNICALL Java_com_reecedunn_espeak_SpeechSynthesis_nativeSynthesize(
     JNIEnv *env, jobject object, jstring text, jboolean isSsml) {
   if (DEBUG) LOGV("%s", __FUNCTION__);
-  const char *c_text = text ? (*env)->GetStringUTFChars(env, text, NULL) : NULL;
+
+  if (text == NULL)
+    return JNI_FALSE;
+
+  const char *c_text = (*env)->GetStringUTFChars(env, text, NULL);
+  if (c_text == NULL)
+    return JNI_FALSE;
+
   unsigned int unique_identifier;
+
+  /* Register this thread's JNIEnv once for the whole request so the per-chunk
+   * callback never has to attach or look it up. */
+  tls_env = env;
 
   espeak_SetSynthCallback(SynthCallback);
   frames_delivered = 0;
-  atomic_store(&stop_requested, 0);
+  completion_sent = 0;
+  agc_prev = 0.0f;
+  agc_gain = 1.0f;
+  atomic_store_explicit(&stop_requested, 0, memory_order_release);
+
   const espeak_ERROR result = espeak_Synth(c_text, strlen(c_text), 0,  // position
                POS_CHARACTER, 0, // end position (0 means no end position)
                isSsml ? espeakCHARS_UTF8 | espeakSSML // UTF-8 encoded SSML
                       : espeakCHARS_UTF8,             // UTF-8 encoded text
                &unique_identifier, object);
   espeak_Synchronize();
+
+  /* If the request was stopped, perform espeak's cancel bookkeeping here, on
+   * the synthesis thread, now that espeak_Synth has returned.  espeak_Cancel()
+   * resets the embedded-voice state and restores every saved parameter
+   * (rate/pitch/volume/...); calling it from nativeStop's thread while
+   * synthesis was running would have raced with the synthesizer reading those
+   * very values.  Doing it here keeps nativeStop lock-free and race-free while
+   * still leaving espeak in a clean state for the next utterance. */
+  if (stop_is_requested())
+    espeak_Cancel();
 
   if (c_text) (*env)->ReleaseStringUTFChars(env, text, c_text);
 
@@ -406,9 +537,13 @@ JNICALL Java_com_reecedunn_espeak_SpeechSynthesis_nativeSynthesize(
 JNIEXPORT jboolean
 JNICALL Java_com_reecedunn_espeak_SpeechSynthesis_nativeStop(
     JNIEnv *env, jobject object) {
+  /* Do the one thing that matters first: a single lock-free atomic store.  No
+   * mutex, no espeak call, no JNI call, no logging before it -- this returns
+   * immediately no matter what the synthesis thread is doing.  The synthesis
+   * thread observes the flag in SynthCallback and aborts espeak_Synth. */
+  atomic_store_explicit(&stop_requested, 1, memory_order_release);
+
   if (DEBUG) LOGV("%s", __FUNCTION__);
-  atomic_store(&stop_requested, 1);
-  espeak_Cancel();
 
   return JNI_TRUE;
 }
